@@ -28,6 +28,13 @@ const RATE = 100000
 // leaves its promise pending forever and silently stalls whatever awaits it.
 const REQUEST_TIMEOUT_MS = 60000
 
+// Marketplace pages store a "more purchase options" bundle in ProductBlurb.
+// That HTML is not a book description.
+function bookBlurb(html) {
+    if (!html || /marketplace-listing__bundle-listing/.test(html)) return ''
+    return convert(html, {wordwrap: false}).replace(/\s+/g,' ').trim()
+}
+
 const numbers = {
     one: 1,
     two: 2,
@@ -3167,40 +3174,7 @@ ${background.flaws.map(r=>`| ${r.diceRoll} | ${r.description} |`).join('\n')}
                 resolve(loreglossary)
             })
             prog.detail = `Exporting sources`
-            let manifestZip = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
-            if (!fs.existsSync(path.join(app.getPath("userData"),"manifest.json"))) {
-                manifestZip.extractEntryTo("manifest.json",app.getPath("userData"))
-            }
-            const manifest = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"),"manifest.json")))
-            const files  = JSON.parse(manifestZip.readAsText("files.txt"))?.files
-            for (const file of files) {
-                for (const local of file.LocalUrl) {
-                    if (local.match(/^\/images\/book-covers/)) {
-                        let filename = path.basename(local)
-                        if (!fs.existsSync(path.join(app.getPath("userData"),"book-covers"))) {
-                            fs.mkdirSync(path.join(app.getPath("userData"),"book-covers"))
-                        }
-                        if (fs.existsSync(path.join(app.getPath("userData"),"book-covers",filename))) {
-                            continue
-                        } else {
-                            let image = await this.getImage(file.RemoteUrl).catch(e=>`Couldn't download cover for ${local}: ${e}`)
-                            fs.writeFileSync(path.join(app.getPath("userData"),"book-covers",filename),image)
-                        }
-                    }
-                }
-            }
-            const sources = manifest.map(s=>{
-                zip.addLocalFile(path.join(app.getPath("userData"),"book-covers",s.ImageUrl),"rules",`source-${s.ImageUrl}`)
-                return {
-                    id: uuid5(`https://www.dndbeyond.com/sources/dnd/${s.DirectoryName}`,uuid5.URL),
-                    name: s.Title,
-                    slug: s.DirectoryName,
-                    type: "source",
-                    tags: [ "Source", s.Type ],
-                    descr: tdSvc.turndown(s.ProductBlurb),
-                    image: `source-${s.ImageUrl}`
-                }
-            })
+            const sources = await this.catalogSources(zip)
             let missingSrcs = []
             const findMissingSrc = e=>{
                 e.sources?.forEach(a=>{
@@ -3258,40 +3232,7 @@ ${background.flaws.map(r=>`| ${r.diceRoll} | ${r.description} |`).join('\n')}
             ]),'utf8'),null)
         } else {
             prog.detail = `Exporting sources`
-            let manifestZip = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
-            if (!fs.existsSync(path.join(app.getPath("userData"),"manifest.json"))) {
-                manifestZip.extractEntryTo("manifest.json",app.getPath("userData"))
-            }
-            const manifest = JSON.parse(fs.readFileSync(path.join(app.getPath("userData"),"manifest.json")))
-            const files  = JSON.parse(manifestZip.readAsText("files.txt"))?.files
-            for (const file of files) {
-                for (const local of file.LocalUrl) {
-                    if (local.match(/^\/images\/book-covers/)) {
-                        let filename = path.basename(local)
-                        if (!fs.existsSync(path.join(app.getPath("userData"),"book-covers"))) {
-                            fs.mkdirSync(path.join(app.getPath("userData"),"book-covers"))
-                        }
-                        if (fs.existsSync(path.join(app.getPath("userData"),"book-covers",filename))) {
-                            continue
-                        } else {
-                            let image = await this.getImage(file.RemoteUrl).catch(e=>`Couldn't download cover for ${local}: ${e}`)
-                            fs.writeFileSync(path.join(app.getPath("userData"),"book-covers",filename),image)
-                        }
-                    }
-                }
-            }
-            const sources = manifest.filter(f=>f.Id==source).map(s=>{
-                zip.addLocalFile(path.join(app.getPath("userData"),"book-covers",s.ImageUrl),"rules",`source-${s.ImageUrl}`)
-                return {
-                    id: uuid5(`https://www.dndbeyond.com/sources/dnd/${s.DirectoryName}`,uuid5.URL),
-                    name: s.Title,
-                    slug: s.DirectoryName,
-                    type: "source",
-                    tags: [ "Source", s.Type ],
-                    descr: tdSvc.turndown(s.ProductBlurb),
-                    image: `source-${s.ImageUrl}`
-                }
-            })
+            const sources = await this.catalogSources(zip, source)
             await zip.addFile("rules.json",Buffer.from(JSON.stringify([
                 ...sources
             ]),'utf8'),null)
@@ -4040,6 +3981,118 @@ ${background.flaws.map(r=>`| ${r.diceRoll} | ${r.description} |`).join('\n')}
         return monsterEntry
     }
 
+    // D&D Beyond dropped manifest.json from the manifest zip. Older zips still have it.
+    readManifestBooks() {
+        const manifestPath = path.join(app.getPath("userData"),"manifest.zip")
+        if (!fs.existsSync(manifestPath)) return null
+        let zip
+        try {
+            zip = new AdmZip(manifestPath)
+        } catch (e) {
+            console.log(`Could not open manifest.zip: ${e}`)
+            return null
+        }
+        if (!zip.getEntry("manifest.json")) return null
+        const raw = zip.readAsText("manifest.json")
+        if (!raw || !raw.trim()) return null
+        try {
+            const data = JSON.parse(raw)
+            return Array.isArray(data) ? data : null
+        } catch (e) {
+            console.log(`Could not parse manifest.json: ${e}`)
+            return null
+        }
+    }
+
+    readSourceRow(id) {
+        const dbPath = path.join(app.getPath("userData"),"skeleton.db3")
+        if (!fs.existsSync(dbPath)) return null
+        const db = new sqlite3(dbPath)
+        try {
+            return db.prepare(`SELECT ID, Name, Description, ProductBlurb, Type FROM RPGSource WHERE ID = ?`).get(id) || null
+        } finally {
+            db.close()
+        }
+    }
+
+    async catalogSources(zip, sourceId=null) {
+        const tdSvc = new turndown()
+        tdSvc.use(turndownGfm.gfm)
+        const blurb = (html) => (/marketplace-listing__bundle-listing/.test(html||'')) ? '' : tdSvc.turndown(html||'')
+        const books = this.readManifestBooks()
+        if (books) {
+            const manifestZip = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
+            const files = JSON.parse(manifestZip.readAsText("files.txt"))?.files || []
+            for (const file of files) {
+                for (const local of file.LocalUrl) {
+                    if (!local.match(/^\/images\/book-covers/)) continue
+                    let filename = path.basename(local)
+                    if (!fs.existsSync(path.join(app.getPath("userData"),"book-covers"))) {
+                        fs.mkdirSync(path.join(app.getPath("userData"),"book-covers"))
+                    }
+                    if (fs.existsSync(path.join(app.getPath("userData"),"book-covers",filename))) continue
+                    let image = await this.getImage(file.RemoteUrl).catch(e=>`Couldn't download cover for ${local}: ${e}`)
+                    fs.writeFileSync(path.join(app.getPath("userData"),"book-covers",filename),image)
+                }
+            }
+            return books.filter(s => sourceId == null || s.Id == sourceId).map(s => {
+                const entry = {
+                    id: uuid5(`https://www.dndbeyond.com/sources/dnd/${s.DirectoryName}`,uuid5.URL),
+                    name: s.Title,
+                    slug: s.DirectoryName,
+                    type: "source",
+                    tags: [ "Source", s.Type ],
+                    descr: blurb(s.ProductBlurb)
+                }
+                if (s.ImageUrl) {
+                    zip.addLocalFile(path.join(app.getPath("userData"),"book-covers",s.ImageUrl),"rules",`source-${s.ImageUrl}`)
+                    entry.image = `source-${s.ImageUrl}`
+                }
+                return entry
+            })
+        }
+        const dbPath = path.join(app.getPath("userData"),"skeleton.db3")
+        if (!fs.existsSync(dbPath)) return []
+        const db = new sqlite3(dbPath)
+        let rows
+        try {
+            rows = db.prepare(`SELECT ID, Name, Description, ProductBlurb, Type FROM RPGSource ORDER BY SortOrder, ID`).all()
+        } finally {
+            db.close()
+        }
+        if (sourceId != null) rows = rows.filter(s => s.ID == sourceId)
+        const sources = []
+        for (const s of rows) {
+            const slug = (s.Name||'').toLowerCase()
+            const entry = {
+                id: uuid5(`https://www.dndbeyond.com/sources/dnd/${slug}`,uuid5.URL),
+                name: s.Description,
+                slug,
+                type: "source",
+                tags: [ "Source", s.Type ].filter(Boolean),
+                descr: blurb(s.ProductBlurb)
+            }
+            let avatarURL = this.ruledata?.sources?.find(r => r.id === s.ID)?.avatarURL
+            if (s.Name == "CR") avatarURL = "https://www.dndbeyond.com/avatars/105/174/636512853628516966.png"
+            if (avatarURL) {
+                let ext = ''
+                try { ext = path.extname(new URL(avatarURL).pathname) } catch (e) { ext = '' }
+                if (ext) {
+                    const image = await this.getImage(avatarURL).catch(e=>{
+                        console.log(`Couldn't download cover for ${s.Name}: ${e}`)
+                        return null
+                    })
+                    if (Buffer.isBuffer(image)) {
+                        zip.addFile(`rules/source-${slug}${ext}`, image)
+                        entry.image = `source-${slug}${ext}`
+                    }
+                }
+            }
+            sources.push(entry)
+        }
+        return sources
+    }
+
     async getModule(moduleId,filename,win) {
         await this.setCobaltSession()
         if (!this.ruledata) await this.getRuleData().catch(e=>{throw new Error(e)})
@@ -4143,13 +4196,10 @@ ${background.flaws.map(r=>`| ${r.diceRoll} | ${r.description} |`).join('\n')}
                 { image: `images/cover.jpg` }
             ]
         }
-        if (fs.existsSync(path.join(app.getPath("userData"),"manifest.zip"))) {
-            let manifest = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
-            manifest = JSON.parse(manifest.readAsText("manifest.json"))
-            let bookinfo = manifest.find(s=>s.Id===moduleId)
-            mod._content.push({category: bookinfo?.Type?.toLowerCase()||''})
-            mod._content.push({description: bookinfo?.ShortDescription||''})         
-        }
+        const bookinfo = this.readManifestBooks()?.find(s=>s.Id===moduleId)
+        const sourceRow = bookinfo ? null : this.readSourceRow(moduleId)
+        mod._content.push({category: (bookinfo?.Type || sourceRow?.Type || '').toLowerCase()})
+        mod._content.push({description: bookinfo?.ShortDescription || bookBlurb(sourceRow?.ProductBlurb) || ''})
         var zip = AdmZip(filename)
         let ddbVer = zip.readAsText("version.txt").trim()
         let modVer = app.getVersion().split(".")
@@ -5845,12 +5895,12 @@ function doSearch(el,resId) {
                     name: mod._content.find(c=>c.name).name,
                     acronym: mod._content.find(c=>c.code).code,
                     author: mod._content.find(c=>c.author).author,
-                    category: mod._content.find(c=>c.category).category,
+                    category: mod._content.find(c=>'category' in c)?.category || '',
                     slug: mod._content.find(c=>c.slug).slug,
                     descr: mod._content.find(c=>c.description)?.description||'',
                     image: mod._content.find(c=>c.image).image,
                     version: mod._attrs.version.toString() || app.getVersion(),
-                    tags: [ 'D&D Beyond', mod._content.find(c=>c.category).category ],
+                    tags: [ 'D&D Beyond', mod._content.find(c=>'category' in c)?.category || '' ],
                     system: 'dnd5e'
                 }))
                 zip.addFile('pages.json',JSON.stringify(mod._content.filter(c=>c.page).map(p=>({
@@ -6070,7 +6120,9 @@ function doSearch(el,resId) {
                 if (mstat.mtime.getTime() > stat.mtime.getTime()) {
                     let manifest = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
                     manifest.extractEntryTo("skeleton.db3",app.getPath("userData"),false,true)
-                    manifest.extractEntryTo("manifest.json",app.getPath("userData"))
+                    if (manifest.getEntry("manifest.json")) {
+                        manifest.extractEntryTo("manifest.json",app.getPath("userData"))
+                    }
                 }
                 this.manifestTimestamp = mstat.mtimeMs
             }

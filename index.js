@@ -715,9 +715,11 @@ function extractManifest(manifestPath) {
         const head = fs.readFileSync(manifestPath).subarray(0,200).toString('utf8').replace(/\s+/g,' ')
         throw new Error(`Downloaded manifest is not a zip file (${e.message}). Start of response: ${head}`)
     }
-    for (const entry of ["skeleton.db3","manifest.json"]) {
-        if (!manifest.getEntry(entry)) throw new Error(`Manifest zip is missing ${entry}`)
-        manifest.extractEntryTo(entry,app.getPath("userData"),false,true)
+    if (!manifest.getEntry("skeleton.db3")) throw new Error("Manifest zip is missing skeleton.db3")
+    manifest.extractEntryTo("skeleton.db3",app.getPath("userData"),false,true)
+    // Current manifests keep the source list in skeleton.db3. Older ones also shipped manifest.json.
+    if (manifest.getEntry("manifest.json")) {
+        manifest.extractEntryTo("manifest.json",app.getPath("userData"),false,true)
     }
     return manifest
 }
