@@ -262,20 +262,15 @@ function openURL(u) {
 }
 encounterhost = preferences.value('main.encounterhost');
 app.on('ready', () => {
-        if (!fs.existsSync(path.join(app.getPath("cache"),app.getName(),"imagecache"))) {
-            fs.mkdir(path.join(app.getPath("cache"),app.getName(),"imagecache"),{recursive:true},()=>{})
-        }
-        if (!fs.existsSync(path.join(app.getPath("cache"),app.getName(),"datacache"))) {
-            fs.mkdir(path.join(app.getPath("cache"),app.getName(),"datacache"),{recursive:true},()=>{})
-        }
-        if (!fs.existsSync(path.join(app.getPath("cache"),app.getName(),"modcache"))) {
-            fs.mkdir(path.join(app.getPath("cache"),app.getName(),"modcache"),{recursive:true},()=>{})
+        // Created synchronously: the async versions raced the readdir below on first run.
+        for (const dir of ["imagecache","datacache","modcache"]) {
+            fs.mkdirSync(path.join(app.getPath("cache"),app.getName(),dir),{recursive:true})
         }
         const imgcache = path.join(app.getPath("cache"),app.getName(),"imagecache")
         const modcache = path.join(app.getPath("cache"),app.getName(),"modcache")
         fs.readdir(imgcache,(e,files)=>{
             if (e) {
-                console(e)
+                console.error(e)
                 return
             }
             files.forEach(f=>{
@@ -532,13 +527,22 @@ app.on('ready', () => {
                 (() => new Promise(resolve => setTimeout(resolve, Math.floor(Math.random()*500))))().then(()=>
                 ddb.getUserData()
                     .then(()=>{
-                        updateManifest().then(()=>{
-                                ddb.getRuleData().then(()=>{
-                                    populateCampaignMenu()
-                                    populateCompendiumMenu()
-                                }).catch(e=>displayError(`Could not load rule data: ${e}`))
-                            }
-                        )
+                        console.log(`[startup] Logged in as user ${ddb.userId}`)
+                        updateManifest()
+                            .then(()=>{
+                                console.log("[startup] Manifest ready, loading rule data")
+                                return ddb.getRuleData()
+                            })
+                            .then(()=>{
+                                console.log("[startup] Rule data loaded, populating menus")
+                                populateCampaignMenu()
+                                // populateCompendiumMenu shows its own error dialog before rejecting
+                                populateCompendiumMenu().catch(()=>{})
+                            })
+                            .catch(e=>{
+                                console.error("[startup] Failed:",e)
+                                displayError(`Could not finish loading D&D Beyond data: ${e?.message||e}`)
+                            })
                     })
                     .catch(e=>{
                         if (e == "Not logged in" && !u.startsWith("https://www.dndbeyond.com/sign-in")) {
@@ -701,46 +705,80 @@ app.on('will-quit', () => {
 		    _ws.close(1001,"Going away")
 		}
 	})
+function extractManifest(manifestPath) {
+    // Throws a readable error if D&D Beyond handed back something other than a manifest zip
+    // (an HTML sign-in page or a JSON error body, for example).
+    let manifest
+    try {
+        manifest = new AdmZip(manifestPath)
+    } catch (e) {
+        const head = fs.readFileSync(manifestPath).subarray(0,200).toString('utf8').replace(/\s+/g,' ')
+        throw new Error(`Downloaded manifest is not a zip file (${e.message}). Start of response: ${head}`)
+    }
+    for (const entry of ["skeleton.db3","manifest.json"]) {
+        if (!manifest.getEntry(entry)) throw new Error(`Manifest zip is missing ${entry}`)
+        manifest.extractEntryTo(entry,app.getPath("userData"),false,true)
+    }
+    return manifest
+}
 function updateManifest() {
     return new Promise((resolve,reject)=>{
+        const userData = app.getPath("userData")
+        const manifestPath = path.join(userData,"manifest.zip")
+        const skeletonPath = path.join(userData,"skeleton.db3")
         let manifestVersion = 0
-        if (fs.existsSync(path.join(app.getPath("userData"),"manifest.zip"))) {
-            let manifest = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
-            manifestVersion = parseInt(manifest.readAsText("version.txt").trim())
-            if (fs.existsSync(path.join(app.getPath("userData"),"skeleton.db3"))) {
-                const stat = fs.statSync(path.join(app.getPath("userData"),"skeleton.db3"))
-                const mstat = fs.statSync(path.join(app.getPath("userData"),"manifest.zip"))
-                if (mstat.mtime > stat.mtime) 
-                    manifest.extractEntryTo("skeleton.db3",app.getPath("userData"),false,true)
-                    manifest.extractEntryTo("manifest.json",app.getPath("userData"),false,true)
+        if (fs.existsSync(manifestPath)) {
+            try {
+                const manifest = new AdmZip(manifestPath)
+                manifestVersion = parseInt(manifest.readAsText("version.txt").trim()) || 0
+                const needsExtract = !fs.existsSync(skeletonPath)
+                    || fs.statSync(manifestPath).mtime > fs.statSync(skeletonPath).mtime
+                if (needsExtract) extractManifest(manifestPath)
+            } catch (e) {
+                // A corrupt or truncated manifest from an earlier failed run: discard it and re-download.
+                console.error(`[manifest] Existing manifest unusable, will re-download: ${e}`)
+                fs.rmSync(manifestPath,{force: true})
+                fs.rmSync(skeletonPath,{force: true})
+                manifestVersion = 0
             }
         }
+        console.log(`[manifest] Local manifest version: ${manifestVersion}`)
         ddb.checkManifestVersion(manifestVersion).then(res=>{
-            if (res?.data?.manifestUpdateAvailable) {
+            console.log("[manifest] Version check response:",JSON.stringify(res))
+            const haveSkeleton = fs.existsSync(skeletonPath)
+            if (!res && !haveSkeleton) {
+                return reject(new Error("D&D Beyond did not answer the manifest version check, and there is no local manifest to fall back on."))
+            }
+            if (res?.data?.manifestUpdateAvailable || !haveSkeleton) {
                 let prog
                 download(_win,"https://www.dndbeyond.com/mobile/api/v6/download-manifest",{
                     filename: "manifest.zip",
-                    directory: app.getPath("userData"),
+                    directory: userData,
+                    overwrite: true,
                     onStarted: (d) => {
                         prog = new ProgressBar({title: "Retrieving Manifest...", text: "Downloading latest manifest...", detail: "Retrieving manifest from D&D Beyond...",indeterminate: (d.getTotalBytes())?false:true,maxValue: 100})
                     },
-                    onProgress: (p) => {if(!prog.isCompleted())prog.value=p.percent*100},
+                    onProgress: (p) => {if(prog && !prog.isCompleted())prog.value=p.percent*100},
                     onCompleted: () => {
-                        let manifest = new AdmZip(path.join(app.getPath("userData"),"manifest.zip"))
-                        manifest.extractEntryTo("skeleton.db3",app.getPath("userData"),false,true)
-                        manifest.extractEntryTo("manifest.json",app.getPath("userData"),false,true)
-                        populateCompendiumMenu(true)
+                        if (prog && !prog.isCompleted()) prog.setCompleted()
+                        try {
+                            extractManifest(manifestPath)
+                        } catch (e) {
+                            fs.rmSync(manifestPath,{force: true})
+                            return reject(e)
+                        }
+                        console.log("[manifest] Downloaded and extracted")
                         resolve("Updated")
                     }
                 }).catch(e=>{
-                    console.log(`Manifest Download Error: ${e}`)
-                    return reject(e)
+                    if (prog && !prog.isCompleted()) prog.setCompleted()
+                    console.error(`[manifest] Download error: ${e}`)
+                    reject(new Error(`Manifest download failed: ${e?.message||e}`))
                 })
             } else {
-                console.log(res)
                 resolve(res)
             }
-        })
+        }).catch(e=>reject(new Error(`Manifest version check failed: ${e?.message||e}`)))
     })
 }
 function populateCampaignMenu(force=false) {

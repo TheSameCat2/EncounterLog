@@ -24,6 +24,9 @@ const { slugify, camelCase, fixDDBLinks, fixDDBTag, markDownLinks, markDownImage
 const convertCharacter = require('./convert-character');
 
 const RATE = 100000
+// Without this, a request that never gets a response (dropped connection, proxy stall)
+// leaves its promise pending forever and silently stalls whatever awaits it.
+const REQUEST_TIMEOUT_MS = 60000
 
 const numbers = {
     one: 1,
@@ -313,18 +316,12 @@ class DDB {
     }
 
     searchCookies() {
-	return new Promise((resolve,reject) => {
-	    session.defaultSession.cookies.get({})
-		.then(cookies => {
-		    for(var cookie of cookies) {
-			if (cookie.name == "CobaltSession") {
-			    resolve(cookie.value)
-                            break
-			}
-		    }
-                    reject(null)
-	        })
-	})
+	return session.defaultSession.cookies.get({name: "CobaltSession"})
+	    .then(cookies => {
+		const cookie = cookies.find(c => c.domain?.endsWith("dndbeyond.com")) ?? cookies[0]
+		if (!cookie) throw new Error("No CobaltSession cookie found")
+		return cookie.value
+	    })
     }
 
     async setCobaltSession() {
@@ -487,20 +484,31 @@ class DDB {
                         //console.log(`CobaltSession=${this.cobaltsession}`)
                         request.setHeader('Cookie',`CobaltSession=${this.cobaltsession}`)
                     }
+                    let timer = null
+                    request.on('error', (e) => {
+                        clearTimeout(timer)
+                        console.error(`[http] POST ${url} failed: ${e}`)
+                        reject(e)
+                    })
                     request.on('response', (response) => {
                       let body = ''
-                      if (response.statusCode != 200) {
-                          console.log(response)
-                          if (response.statusCode > 299)
-                              reject(response.statusCode)
-                      }
                       response.on('data', (chunk) => {
                         body += chunk.toString()
                       })
+                      response.on('error', (e) => {
+                        clearTimeout(timer)
+                        reject(e)
+                      })
                       response.on('end', () => {
+                        clearTimeout(timer)
+                        if (response.statusCode > 299) {
+                            console.error(`[http] POST ${url} -> ${response.statusCode}: ${body.substring(0,500)}`)
+                            return reject(response.statusCode)
+                        }
                         try{
                             resolve(JSON.parse(body))
                         } catch(e) {
+                            console.error(`[http] POST ${url} returned non-JSON: ${body.substring(0,500)}`)
                             reject(e)
                         }
                       })
@@ -509,6 +517,12 @@ class DDB {
                         if (this.ratelimit < RATE) {
                             if (url.startsWith("https://www.dndbeyond.com/"))
                                 this.ratelimit += 1
+                            // Timer starts when the request is actually sent, not while it waits in the rate limiter.
+                            timer = setTimeout(()=>{
+                                console.error(`[http] POST ${url} timed out after ${REQUEST_TIMEOUT_MS}ms`)
+                                request.abort()
+                                reject(new Error(`Request to ${url} timed out`))
+                            },REQUEST_TIMEOUT_MS)
                             request.write(postbody)
                             request.end()
                         } else {
@@ -531,19 +545,31 @@ class DDB {
                         request.setHeader('Cookie',`CobaltSession=${this.cobaltsession}`)
                         request.setHeader('Accept','application/json')
                     }
+                    let timer = null
+                    request.on('error', (e) => {
+                        clearTimeout(timer)
+                        console.error(`[http] GET ${url} failed: ${e}`)
+                        reject(e)
+                    })
                     request.on('response', (response) => {
                       let body = ''
                       response.on('data', (chunk) => {
                         body += chunk.toString()
                       })
+                      response.on('error', (e) => {
+                        clearTimeout(timer)
+                        reject(e)
+                      })
                       response.on('end', () => {
-                          if (response.statusCode != 200) {
-                              console.log(body)
-                            reject(response.statusCode)
-                          }
+                        clearTimeout(timer)
+                        if (response.statusCode != 200) {
+                            console.error(`[http] GET ${url} -> ${response.statusCode}: ${body.substring(0,500)}`)
+                            return reject(response.statusCode)
+                        }
                         try{
                             resolve(JSON.parse(body))
                         } catch(e) {
+                            console.error(`[http] GET ${url} returned non-JSON: ${body.substring(0,500)}`)
                             reject(e)
                         }
                       })
@@ -552,6 +578,11 @@ class DDB {
                         if (this.ratelimit < RATE) {
                             if (url.startsWith("https://www.dndbeyond.com/"))
                                 this.ratelimit += 1
+                            timer = setTimeout(()=>{
+                                console.error(`[http] GET ${url} timed out after ${REQUEST_TIMEOUT_MS}ms`)
+                                request.abort()
+                                reject(new Error(`Request to ${url} timed out`))
+                            },REQUEST_TIMEOUT_MS)
                             request.end()
                         } else {
                             setTimeout(ratelimit,Math.floor(Math.random()*1000)+1000)
